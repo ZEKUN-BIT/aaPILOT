@@ -1,8 +1,8 @@
-An end-to-end pipeline designed to filter, process, fine-tune, and generate sequences using **LigandMPNN** for specific enzyme families (Pfam domains). 
+An end-to-end pipeline designed to filter, process, fine-tune, and generate sequences using **LigandMPNN** for specific enzyme families. 
 
 This repository provides tools to automatically clean experimental PDBs and AlphaFold structures, parse 3D ligand-protein coordinates, fine-tune pre-trained LigandMPNN models (preventing catastrophic forgetting), and run automated batch inference across multiple model checkpoints and temperatures.
 
-## 🚀 Features
+## Features
 
 - **Automated Structure Filtering (`training/filter.py`)**: 
   - Filters PDB structures by resolution (< 3.5Å).
@@ -16,24 +16,9 @@ This repository provides tools to automatically clean experimental PDBs and Alph
   - Employs Automatic Mixed Precision (AMP) and Gradient Accumulation for memory-efficient training.
 - **Automated Sequence Generation (`generate.py`)**: A wrapper script designed to perform batch sequence generation on input PDBs, iterating through fine-tuned checkpoints and a temperature sweep, while applying customized amino acid biases.
 
-## 📂 Project Structure
 
-```text
-├── generate.py                 # Automated inference script across multiple temps/models
-├── model_params/               # Directory for original LigandMPNN pre-trained weights
-│   ├── ligandmpnn_v_32_005_25.pt
-│   ├── ligandmpnn_v_32_010_25.pt
-│   ├── ligandmpnn_v_32_020_25.pt
-│   └── ligandmpnn_v_32_030_25.pt
-├── README.md
-└── training/                   # Fine-tuning & data processing scripts
-    ├── filter.py               # Data cleaning, domain truncation, and MMseqs2 clustering
-    ├── model_utils.py          # Core model architecture (ProteinMPNN & LigandMPNN)
-    ├── parse_cif.py            # Converts .cif files to .jsonl dictionary formats
-    └── train.py                # Fine-tuning script for LigandMPNN models
-```
 
-## 🛠️ Installation & Requirements
+## Installation & Requirements
 
 1. **Python Environment**: Python 3.8+ and PyTorch (CUDA supported).
 2. **Python Packages**:
@@ -43,7 +28,7 @@ This repository provides tools to automatically clean experimental PDBs and Alph
 3. **External Tools**: 
    - [MMseqs2](https://github.com/soedinglab/MMseqs2) is required for sequence clustering. Ensure `mmseqs` is installed and accessible in your system's PATH.
 
-## 🏃‍♂️ Pipeline Usage
+## Pipeline Usage
 
 ### Step 0: Download Raw Data & Pre-trained Weights
 
@@ -119,6 +104,6 @@ python generate.py
 - Automatically applies an amino acid bias (e.g., boosting `E`, `K`, `R` frequencies) and enforces ligand side-chain context (`--ligand_mpnn_use_side_chain_context 1`).
 - Saves all generated sequences and metrics in the `./seq_new/` directory, categorized by model and temperature.
 
-## 🙏 Acknowledgments
+##  Acknowledgments
 
 This codebase builds upon the architecture and principles of [ProteinMPNN](https://github.com/dauparas/ProteinMPNN) and [LigandMPNN](https://github.com/dauparas/LigandMPNN) by the Baker Lab.

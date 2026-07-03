@@ -7,16 +7,26 @@ from Bio.PDB.Polypeptide import protein_letters_3to1
 PROCESSED_DIR = "enzyme_dataset_processed_70"
 OUTPUT_DIR = "mpnn_finetune_data"
 
-# Map elements to atomic numbers (defaulting to C=6)
-ELEMENT_MAP = {
-    'H': 1, 'C': 6, 'N': 7, 'O': 8, 'F': 9, 
-    'MG': 12, 'P': 15, 'S': 16, 'CL': 17, 'ZN': 30
-}
+ELEMENTS = [
+    "H", "HE", "LI", "BE", "B", "C", "N", "O", "F", "NE",
+    "NA", "MG", "AL", "SI", "P", "S", "CL", "AR", "K", "CA",
+    "SC", "TI", "V", "CR", "MN", "FE", "CO", "NI", "CU", "ZN",
+    "GA", "GE", "AS", "SE", "BR", "KR", "RB", "SR", "Y", "ZR",
+    "NB", "MO", "TC", "RU", "RH", "PD", "AG", "CD", "IN", "SN",
+    "SB", "TE", "I", "XE", "CS", "BA", "LA", "CE", "PR", "ND",
+    "PM", "SM", "EU", "GD", "TB", "DY", "HO", "ER", "TM", "YB",
+    "LU", "HF", "TA", "W", "RE", "OS", "IR", "PT", "AU", "HG",
+    "TL", "PB", "BI", "PO", "AT", "RN", "FR", "RA", "AC", "TH",
+    "PA", "U", "NP", "PU", "AM", "CM", "BK", "CF", "ES", "FM",
+    "MD", "NO", "LR", "RF", "DB", "SG", "BH", "HS", "MT", "DS",
+    "RG", "CN", "NH", "FL", "MC", "LV", "TS", "OG",
+]
+ELEMENT_MAP = {element: index + 1 for index, element in enumerate(ELEMENTS)}
 
 
 def get_atomic_number(atom):
-    element = atom.element.upper()
-    return ELEMENT_MAP.get(element, 6)
+    element = (atom.element or "").strip().upper()
+    return ELEMENT_MAP.get(element, 0)
 
 
 def parse_cif_to_mpnn_dict(cif_path, name):

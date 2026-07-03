@@ -76,6 +76,16 @@ def get_pfam_boundaries_uniprot(uniprot_id, pfam_id):
     return None, None
 
 
+def extract_uniprot_id(file_name):
+    """Extract a UniProt accession from common AlphaFold file names."""
+    stem = Path(file_name).stem
+    if stem.startswith("AF-"):
+        parts = stem.split("-")
+        if len(parts) >= 2 and parts[1]:
+            return parts[1]
+    return stem.split("_")[0]
+
+
 def filter_and_truncate_af(cif_path, output_path, uniprot_id, pfam_id):
     """Truncate AlphaFold structure to Pfam domain and filter by pLDDT."""
     parser = MMCIFParser(QUIET=True)
@@ -126,6 +136,9 @@ def filter_and_truncate_af(cif_path, output_path, uniprot_id, pfam_id):
 
 def run_mmseqs(fasta_in, prefix_out, identity, coverage):
     """Run MMseqs2 for sequence clustering."""
+    if shutil.which("mmseqs") is None:
+        raise RuntimeError("MMseqs2 executable 'mmseqs' was not found in PATH.")
+
     print(f"Running MMseqs2 (id={identity}, cov={coverage})...")
     tmp_dir = f"{prefix_out}_tmp"
     os.makedirs(tmp_dir, exist_ok=True)
@@ -137,16 +150,24 @@ def run_mmseqs(fasta_in, prefix_out, identity, coverage):
         "--cov-mode", "1",
         "-v", "0"
     ]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    process = subprocess.run(cmd, capture_output=True, text=True)
+    if process.returncode != 0:
+        raise RuntimeError(
+            "MMseqs2 clustering failed:\n"
+            f"Command: {' '.join(cmd)}\n"
+            f"STDERR:\n{process.stderr.strip()}"
+        )
 
     retained_ids =[]
     rep_fasta = f"{prefix_out}_rep_seq.fasta"
-    
-    if os.path.exists(rep_fasta):
-        with open(rep_fasta, 'r') as f:
-            for line in f:
-                if line.startswith('>'):
-                    retained_ids.append(line.strip()[1:])
+
+    if not os.path.exists(rep_fasta):
+        raise RuntimeError(f"MMseqs2 did not produce representative FASTA: {rep_fasta}")
+
+    with open(rep_fasta, 'r') as f:
+        for line in f:
+            if line.startswith('>'):
+                retained_ids.append(line.strip()[1:].split()[0])
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
     for ext in ["_all_seqs.fasta", "_cluster.tsv"]:
@@ -168,13 +189,14 @@ def main():
         os.makedirs(pfam_out_dir, exist_ok=True)
 
         fasta_records =[]
+        record_to_file = {}
 
         # Process AlphaFold structures
         af_in_dir = os.path.join(pfam_in_dir, "AlphaFold_predicted")
         if os.path.exists(af_in_dir):
-            af_files =[f for f in os.listdir(af_in_dir) if f.endswith('.cif')]
+            af_files =[f for f in os.listdir(af_in_dir) if f.lower().endswith('.cif')]
             for f_name in tqdm(af_files, desc="Process AF"):
-                uid = f_name.split('.')[0]
+                uid = extract_uniprot_id(f_name)
                 in_path = os.path.join(af_in_dir, f_name)
                 out_path = os.path.join(pfam_out_dir, f_name)
 
@@ -190,14 +212,16 @@ def main():
                     if residue.id[0] == ' ' and resname in protein_letters_3to1:
                         seq += protein_letters_3to1[resname]
                 if seq:
-                    fasta_records.append(f">{uid}_AF\n{seq}\n")
+                    record_id = f"{Path(f_name).stem}__AF"
+                    fasta_records.append(f">{record_id}\n{seq}\n")
+                    record_to_file[record_id] = out_path
 
         # Process PDB structures
         pdb_in_dir = os.path.join(pfam_in_dir, "PDB_experimental")
         if os.path.exists(pdb_in_dir):
-            pdb_files =[f for f in os.listdir(pdb_in_dir) if f.endswith('.cif')]
+            pdb_files =[f for f in os.listdir(pdb_in_dir) if f.lower().endswith('.cif')]
             for f_name in tqdm(pdb_files, desc="Process PDB"):
-                pid = f_name.split('.')[0]
+                pid = Path(f_name).stem
                 in_path = os.path.join(pdb_in_dir, f_name)
 
                 success, msg = filter_pdb_structure(in_path)
@@ -213,7 +237,9 @@ def main():
                         if r.id[0] == ' ' and r.get_resname() in protein_letters_3to1
                     ])
                     if seq:
-                        fasta_records.append(f">{pid}_PDB\n{seq}\n")
+                        record_id = f"{Path(f_name).stem}__PDB"
+                        fasta_records.append(f">{record_id}\n{seq}\n")
+                        record_to_file[record_id] = out_path
 
         # Run clustering
         if not fasta_records:
@@ -230,9 +256,11 @@ def main():
         print(f"[{pfam_id}] Clustering done: retained {len(retained_ids)} / {len(fasta_records)}.")
 
         for rid in retained_ids:
-            uid_or_pid = rid.split('_')[0]
-            ext = ".cif"
-            all_retained_files.append(os.path.join(pfam_out_dir, uid_or_pid + ext))
+            file_path = record_to_file.get(rid)
+            if file_path and os.path.exists(file_path):
+                all_retained_files.append(file_path)
+            else:
+                print(f"[{pfam_id}] Warning: retained MMseqs ID has no matching CIF file: {rid}")
 
     # Train / Val / Test Split
     if all_retained_files:
@@ -241,8 +269,20 @@ def main():
         random.shuffle(all_retained_files)
 
         total = len(all_retained_files)
+        if total < 2:
+            raise RuntimeError(
+                f"Need at least 2 retained structures to create train/val splits; got {total}."
+            )
+
         train_end = int(total * SPLIT_RATIO["train"])
-        val_end = train_end + int(total * SPLIT_RATIO["val"])
+        val_count = int(total * SPLIT_RATIO["val"])
+        if total >= 3:
+            val_count = max(1, val_count)
+            train_end = min(max(1, train_end), total - 2)
+        elif total == 2:
+            train_end = 1
+            val_count = 1
+        val_end = min(total, train_end + val_count)
 
         splits = {
             "train": all_retained_files[:train_end],
@@ -253,10 +293,14 @@ def main():
         for split_name, files in splits.items():
             split_dir = os.path.join(PROCESSED_DIR, f"dataset_{split_name}")
             os.makedirs(split_dir, exist_ok=True)
+            copied = 0
             for file_path in files:
                 if os.path.exists(file_path):
                     shutil.copy2(file_path, os.path.join(split_dir, os.path.basename(file_path)))
-            print(f"{split_name.capitalize()} set: {len(files)} structures.")
+                    copied += 1
+                else:
+                    print(f"Warning: split source file missing, skipped: {file_path}")
+            print(f"{split_name.capitalize()} set: {copied} structures.")
 
         print(f"\nFinished! Dataset saved to: {os.path.abspath(PROCESSED_DIR)}")
 

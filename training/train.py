@@ -1,6 +1,8 @@
 import os
 import json
 import random
+from contextlib import nullcontext
+from pathlib import Path
 import torch
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
@@ -12,8 +14,13 @@ from model_utils import ProteinMPNN, loss_nll, loss_smoothed
 # ==========================================
 # Configuration
 # ==========================================
-DATA_DIR = "mpnn_finetune_data"
-OUTPUT_DIR = "finetuned_ligand_models"
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+
+DATA_DIR = SCRIPT_DIR / "mpnn_finetune_data"
+OUTPUT_DIR = SCRIPT_DIR / "finetuned_ligand_models"
+MODEL_PARAM_DIR = PROJECT_ROOT / "model_params"
+GENERAL_TRAIN_DATA = SCRIPT_DIR / "ligand_mpnn_train_data.jsonl"
 
 # Define the models you want to iterate through
 MODELS_TO_FINETUNE = [
@@ -31,6 +38,27 @@ ATOM_CONTEXT_NUM = 32
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+USE_AMP = device.type == "cuda"
+AMP_DTYPE = torch.bfloat16
+if USE_AMP and hasattr(torch.cuda, "is_bf16_supported") and not torch.cuda.is_bf16_supported():
+    AMP_DTYPE = torch.float16
+
+
+def autocast_context():
+    if not USE_AMP:
+        return nullcontext()
+    return torch.cuda.amp.autocast(dtype=AMP_DTYPE)
+
+
+def checkpoint_metadata(checkpoint):
+    if not isinstance(checkpoint, dict):
+        return {}
+    return {
+        key: value
+        for key, value in checkpoint.items()
+        if key not in {"model_state_dict", "optimizer_state_dict"}
+        and isinstance(value, (int, float, str, bool))
+    }
 
 # ==========================================
 # Dataset Loader
@@ -49,7 +77,9 @@ class MixedStructureDataset(Dataset):
             num_general_needed = int(num_specific * mix_ratio / (1 - mix_ratio))
             
             random.seed(seed)
-            if num_general_needed <= len(general_data):
+            if num_general_needed == 0 or not general_data:
+                sampled_general = []
+            elif num_general_needed <= len(general_data):
                 sampled_general = random.sample(general_data, num_general_needed)
             else:
                 sampled_general = random.choices(general_data, k=num_general_needed)
@@ -61,6 +91,9 @@ class MixedStructureDataset(Dataset):
         print(f"Loaded {num_specific} specific and {len(sampled_general)} general structures. Total: {len(self.data)}")
 
     def _load_jsonl(self, file_path, max_length):
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Required JSONL dataset not found: {file_path}")
+
         loaded = []
         with open(file_path, 'r') as f:
             for line in f:
@@ -161,7 +194,7 @@ def featurize_ligand_mpnn(batch, device, atom_context_num=32):
 # ==========================================
 def train_model(model_name, train_loader, val_loader):
     """Handles the training loop for a specific model."""
-    ckpt_path = f"../model_params/{model_name}.pt"
+    ckpt_path = MODEL_PARAM_DIR / f"{model_name}.pt"
     if not os.path.exists(ckpt_path):
         print(f"Skipping {model_name}: Weights not found at {ckpt_path}")
         return
@@ -176,13 +209,15 @@ def train_model(model_name, train_loader, val_loader):
     
     num_edges = checkpoint.get('num_edges', 25) 
     hidden_dim = checkpoint.get('hidden_dim', 128)
-    num_layers = checkpoint.get('num_encoder_layers', 3)
+    num_encoder_layers = checkpoint.get('num_encoder_layers', 3)
+    num_decoder_layers = checkpoint.get('num_decoder_layers', num_encoder_layers)
+    atom_context_num = checkpoint.get('atom_context_num', ATOM_CONTEXT_NUM)
 
     model = ProteinMPNN(
         num_letters=21, node_features=hidden_dim, edge_features=hidden_dim, hidden_dim=hidden_dim,
-        num_encoder_layers=num_layers, num_decoder_layers=num_layers,
+        num_encoder_layers=num_encoder_layers, num_decoder_layers=num_decoder_layers,
         k_neighbors=num_edges, augment_eps=0.0, dropout=0.1,
-        model_type="ligand_mpnn", atom_context_num=ATOM_CONTEXT_NUM
+        model_type="ligand_mpnn", atom_context_num=atom_context_num
     )
 
     model.load_state_dict(checkpoint_dict)
@@ -191,11 +226,11 @@ def train_model(model_name, train_loader, val_loader):
     # Freeze encoder, unfreeze final decoder layer and output weights
     for name, param in model.named_parameters():
         param.requires_grad = False
-        if "W_out" in name or f"decoder_layers.{num_layers - 1}" in name:
-           param.requires_grad = True  
+        if "W_out" in name or f"decoder_layers.{num_decoder_layers - 1}" in name:
+            param.requires_grad = True
 
     optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LEARNING_RATE)
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.cuda.amp.GradScaler(enabled=USE_AMP)
     best_val_loss = float('inf')
 
     for epoch in range(EPOCHS):
@@ -204,7 +239,7 @@ def train_model(model_name, train_loader, val_loader):
         optimizer.zero_grad()
 
         for step, batch_data in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}/{EPOCHS} [Train]")):
-            feat = featurize_ligand_mpnn(batch_data, device, ATOM_CONTEXT_NUM)
+            feat = featurize_ligand_mpnn(batch_data, device, atom_context_num)
 
             # Synchronized noise injection
             noise_X = torch.randn_like(feat["X"]) * parsed_noise * feat["mask"][:, :, None, None]
@@ -213,7 +248,7 @@ def train_model(model_name, train_loader, val_loader):
             
             valid_mask = feat["mask"] * feat["chain_M"]
             
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16): 
+            with autocast_context():
                 log_probs = model(
                     X_noised, feat["S"], feat["mask"], feat["chain_M"], 
                     feat["residue_idx"], feat["chain_encoding_all"], randn_order,
@@ -240,9 +275,9 @@ def train_model(model_name, train_loader, val_loader):
         model.eval()
         val_loss = 0.0
         
-        with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        with torch.no_grad(), autocast_context():
             for batch_data in tqdm(val_loader, desc=f"Epoch {epoch + 1} [Val]"):
-                feat = featurize_ligand_mpnn(batch_data, device, ATOM_CONTEXT_NUM)
+                feat = featurize_ligand_mpnn(batch_data, device, atom_context_num)
                 randn_order = torch.randn_like(feat["mask"])
                 valid_mask = feat["mask"] * feat["chain_M"]
                 
@@ -261,12 +296,19 @@ def train_model(model_name, train_loader, val_loader):
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             save_path = os.path.join(OUTPUT_DIR, f"{model_name}_finetuned.pt")
-            torch.save({
+            save_checkpoint = checkpoint_metadata(checkpoint)
+            save_checkpoint.update({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': best_val_loss,
-            }, save_path)
+                'num_edges': num_edges,
+                'hidden_dim': hidden_dim,
+                'num_encoder_layers': num_encoder_layers,
+                'num_decoder_layers': num_decoder_layers,
+                'atom_context_num': atom_context_num,
+            })
+            torch.save(save_checkpoint, save_path)
             print(f"--> Saved best model checkpoint to: {save_path}")
 
 
@@ -275,7 +317,7 @@ def main():
     print("Initializing datasets...")
     train_dataset = MixedStructureDataset(
         specific_jsonl=os.path.join(DATA_DIR, "train.jsonl"), 
-        general_jsonl="ligand_mpnn_train_data.jsonl", 
+        general_jsonl=GENERAL_TRAIN_DATA,
         mix_ratio=0.1, 
         max_length=1200
     )
@@ -285,6 +327,11 @@ def main():
         general_jsonl=None,
         mix_ratio=0.0
     )
+
+    if len(train_dataset) == 0:
+        raise ValueError(f"No training records loaded from {DATA_DIR / 'train.jsonl'}")
+    if len(val_dataset) == 0:
+        raise ValueError(f"No validation records loaded from {DATA_DIR / 'val.jsonl'}")
 
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)

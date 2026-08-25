@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.vexor/
+training_runs*/
+evaluation_runs*/
+dataset/
+*.jsonl
+*.log

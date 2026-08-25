@@ -1,344 +1,250 @@
-import os
+"""Fine-tune LigandMPNN on an audited, cluster-separated enzyme dataset."""
+
+import argparse
 import json
+import os
 import random
-from contextlib import nullcontext
+from datetime import datetime
 from pathlib import Path
-import torch
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+
 import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm import tqdm
 
+from data_integrity import seed_everything, validate_disjoint_jsonl
 from model_utils import ProteinMPNN, loss_nll, loss_smoothed
+from featurization import featurize_ligand_mpnn
+from cluster_balanced_sampler import ClusterBalancedSampler
 
-# ==========================================
-# Configuration
-# ==========================================
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent
 
-DATA_DIR = SCRIPT_DIR / "mpnn_finetune_data"
-OUTPUT_DIR = SCRIPT_DIR / "finetuned_ligand_models"
-MODEL_PARAM_DIR = PROJECT_ROOT / "model_params"
-GENERAL_TRAIN_DATA = SCRIPT_DIR / "ligand_mpnn_train_data.jsonl"
-
-# Define the models you want to iterate through
-MODELS_TO_FINETUNE = [
-    "ligandmpnn_v_32_005_25",
-    "ligandmpnn_v_32_010_25",
-    "ligandmpnn_v_32_020_25",
-    "ligandmpnn_v_32_030_25"
+MODELS = [
+    "ligandmpnn_v_32_005_25", "ligandmpnn_v_32_010_25",
+    "ligandmpnn_v_32_020_25", "ligandmpnn_v_32_030_25",
 ]
 
-EPOCHS = 50
-BATCH_SIZE = 1
-ACCUMULATION_STEPS = 8
-LEARNING_RATE = 5e-5
-ATOM_CONTEXT_NUM = 32
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-USE_AMP = device.type == "cuda"
-AMP_DTYPE = torch.bfloat16
-if USE_AMP and hasattr(torch.cuda, "is_bf16_supported") and not torch.cuda.is_bf16_supported():
-    AMP_DTYPE = torch.float16
-
-
-def autocast_context():
-    if not USE_AMP:
-        return nullcontext()
-    return torch.cuda.amp.autocast(dtype=AMP_DTYPE)
-
-
-def checkpoint_metadata(checkpoint):
-    if not isinstance(checkpoint, dict):
-        return {}
-    return {
-        key: value
-        for key, value in checkpoint.items()
-        if key not in {"model_state_dict", "optimizer_state_dict"}
-        and isinstance(value, (int, float, str, bool))
-    }
-
-# ==========================================
-# Dataset Loader
-# ==========================================
-class MixedStructureDataset(Dataset):
-    def __init__(self, specific_jsonl, general_jsonl, mix_ratio=0.05, max_length=1200, seed=42):
-        """
-        Mixed dataset loader for domain-specific fine-tuning to prevent catastrophic forgetting.
-        """
-        self.data = []
-        specific_data = self._load_jsonl(specific_jsonl, max_length)
-        num_specific = len(specific_data)
-
-        if mix_ratio > 0 and general_jsonl and os.path.exists(general_jsonl):
-            general_data = self._load_jsonl(general_jsonl, max_length)
-            num_general_needed = int(num_specific * mix_ratio / (1 - mix_ratio))
-            
-            random.seed(seed)
-            if num_general_needed == 0 or not general_data:
-                sampled_general = []
-            elif num_general_needed <= len(general_data):
-                sampled_general = random.sample(general_data, num_general_needed)
-            else:
-                sampled_general = random.choices(general_data, k=num_general_needed)
-        else:
-            sampled_general = []
-            
-        self.data = specific_data + sampled_general
-        random.shuffle(self.data)
-        print(f"Loaded {num_specific} specific and {len(sampled_general)} general structures. Total: {len(self.data)}")
-
-    def _load_jsonl(self, file_path, max_length):
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"Required JSONL dataset not found: {file_path}")
-
-        loaded = []
-        with open(file_path, 'r') as f:
-            for line in f:
-                item = json.loads(line)
-                if len(item['seq']) <= max_length:
-                    loaded.append(item)
-        return loaded
+class JsonlDataset(Dataset):
+    def __init__(self, path, max_length=2400):
+        self.rows = []
+        self.dropped = 0
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    row = json.loads(line)
+                    if len(row["seq"]) <= max_length:
+                        self.rows.append(row)
+                    else:
+                        self.dropped += 1
+        if self.dropped:
+            print(f"{path}: dropped {self.dropped} rows longer than {max_length}")
+        if not self.rows:
+            raise ValueError(f"No usable records in {path}")
 
     def __len__(self):
-        return len(self.data)
+        return len(self.rows)
 
-    def __getitem__(self, idx):
-        return self.data[idx]
+    def __getitem__(self, index):
+        return self.rows[index]
 
-def collate_fn(batch):
-    return batch
 
-# ==========================================
-# Featurization
-# ==========================================
-def featurize_ligand_mpnn(batch, device, atom_context_num=32):
-    alphabet = 'ACDEFGHIKLMNPQRSTVWYX'
-    B = len(batch)
-    lengths = [len(b['seq']) for b in batch]
-    L_max = max(lengths)
+def collate_featurize(rows, atom_context_num):
+    """Featurize one batch on CPU; runs inside DataLoader workers, so CPU cost
+    overlaps with GPU compute via prefetching."""
+    return featurize_ligand_mpnn(rows, "cpu", atom_context_num)
 
-    X = np.zeros([B, L_max, 4, 3])
-    S = np.zeros([B, L_max], dtype=np.int32)
-    mask = np.zeros([B, L_max], dtype=np.float32)
-    chain_M = np.zeros([B, L_max], dtype=np.float32)
-    residue_idx = -100 * np.ones([B, L_max], dtype=np.int32)
-    chain_encoding_all = np.ones([B, L_max], dtype=np.int32)
 
-    Y = np.zeros([B, L_max, atom_context_num, 3])
-    Y_t = np.zeros([B, L_max, atom_context_num], dtype=np.int32)
-    Y_m = np.zeros([B, L_max, atom_context_num], dtype=np.float32)
+def to_device(feat, device):
+    return {k: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
+            for k, v in feat.items()}
 
-    for i, b in enumerate(batch):
-        seq = b['seq']
-        l_seq = len(seq)
-        mask[i, :l_seq] = 1.0
-        chain_M[i, :l_seq] = 1.0 
 
-        chain_keys = [k.replace('seq_chain_', '') for k in b.keys() if k.startswith('seq_chain_')]
-        global_idx = 0
-        all_ca_coords = []
-        
-        for c_idx, chain_id in enumerate(chain_keys):
-            c_seq = b[f'seq_chain_{chain_id}']
-            c_len = len(c_seq)
-            
-            for j, aa in enumerate(c_seq):
-                S[i, global_idx + j] = alphabet.index(aa) if aa in alphabet else 20
-            
-            chain_encoding_all[i, global_idx:global_idx + c_len] = c_idx + 1
-            residue_idx[i, global_idx:global_idx + c_len] = 100 * c_idx + np.arange(c_len)
+class LengthSortedBatchSampler(Sampler):
+    """Pack the balanced sampler's epoch draws into length-sorted batches.
 
-            c_coords = b[f'coords_chain_{chain_id}']
-            X[i, global_idx:global_idx + c_len, 0, :] = c_coords[f'N_chain_{chain_id}']
-            X[i, global_idx:global_idx + c_len, 1, :] = c_coords[f'CA_chain_{chain_id}']
-            X[i, global_idx:global_idx + c_len, 2, :] = c_coords[f'C_chain_{chain_id}']
-            X[i, global_idx:global_idx + c_len, 3, :] = c_coords[f'O_chain_{chain_id}']
-            
-            all_ca_coords.extend(c_coords[f'CA_chain_{chain_id}'])
-            global_idx += c_len
+    Sorting changes only the ORDER of the same multiset of draws, so the
+    target->cluster->member balance is preserved while same-length rows are
+    batched together (minimal padding waste, large speedup vs batch_size=1).
+    """
 
-        # Ligand context extraction
-        if "ligand_coords" in b and len(b["ligand_coords"]) > 0:
-            l_coords = np.array(b["ligand_coords"]) 
-            l_types = np.array(b["ligand_types"])   
-            p_ca_coords = np.array(all_ca_coords)   
+    def __init__(self, base_sampler, lengths, batch_size, seed=42):
+        super().__init__()
+        self.base = base_sampler
+        self.lengths = lengths
+        self.batch_size = batch_size
+        self.seed = seed
+        self.epoch = 0
 
-            dists = np.linalg.norm(p_ca_coords[:, None, :] - l_coords[None, :, :], axis=-1)
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+        self.base.set_epoch(epoch)
 
-            for r_idx in range(l_seq):
-                res_dists = dists[r_idx]
-                k = min(len(l_coords), atom_context_num)
-                top_k_indices = np.argsort(res_dists)[:k]
-                
-                Y[i, r_idx, :k, :] = l_coords[top_k_indices]
-                Y_t[i, r_idx, :k] = l_types[top_k_indices]
-                Y_m[i, r_idx, :k] = 1.0
+    def __iter__(self):
+        indices = list(self.base)
+        indices.sort(key=lambda i: self.lengths[i])
+        batches = [indices[i:i + self.batch_size]
+                   for i in range(0, len(indices), self.batch_size)]
+        rng = random.Random(self.seed + self.epoch)
+        rng.shuffle(batches)
+        yield from batches
 
-    return {
-        "X": torch.from_numpy(X).to(dtype=torch.float32, device=device),
-        "S": torch.from_numpy(S).to(dtype=torch.long, device=device),
-        "mask": torch.from_numpy(mask).to(dtype=torch.float32, device=device),
-        "chain_M": torch.from_numpy(chain_M).to(dtype=torch.float32, device=device),
-        "residue_idx": torch.from_numpy(residue_idx).to(dtype=torch.long, device=device),
-        "chain_encoding_all": torch.from_numpy(chain_encoding_all).to(dtype=torch.long, device=device),
-        "Y": torch.from_numpy(Y).to(dtype=torch.float32, device=device),
-        "Y_t": torch.from_numpy(Y_t).to(dtype=torch.long, device=device),
-        "Y_m": torch.from_numpy(Y_m).to(dtype=torch.float32, device=device)
-    }
+    def __len__(self):
+        return (len(self.base) + self.batch_size - 1) // self.batch_size
 
-# ==========================================
-# Training Pipeline
-# ==========================================
-def train_model(model_name, train_loader, val_loader):
-    """Handles the training loop for a specific model."""
-    ckpt_path = MODEL_PARAM_DIR / f"{model_name}.pt"
-    if not os.path.exists(ckpt_path):
-        print(f"Skipping {model_name}: Weights not found at {ckpt_path}")
-        return
 
-    # Extract noise level directly from model name (e.g., 020 -> 0.2)
-    # Assumes naming convention: ligandmpnn_v_32_020_25
-    parsed_noise = float(model_name.split('_')[3]) / 100.0
-    print(f"\n[{model_name}] Starting training with synced noise level: {parsed_noise}A")
+def model_from_checkpoint(checkpoint, atom_context_num):
+    state = checkpoint.get("model_state_dict", checkpoint)
+    hidden = checkpoint.get("hidden_dim", 128)
+    layers = checkpoint.get("num_encoder_layers", 3)
+    edges = checkpoint.get("num_edges", 25)
+    model = ProteinMPNN(num_letters=21, node_features=hidden, edge_features=hidden,
+                        hidden_dim=hidden, num_encoder_layers=layers,
+                        num_decoder_layers=layers, k_neighbors=edges,
+                        augment_eps=0.0, dropout=0.1, model_type="ligand_mpnn",
+                        atom_context_num=atom_context_num)
+    model.load_state_dict(state)
+    return model, hidden, layers, edges
 
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    checkpoint_dict = checkpoint if 'model_state_dict' not in checkpoint else checkpoint['model_state_dict']
-    
-    num_edges = checkpoint.get('num_edges', 25) 
-    hidden_dim = checkpoint.get('hidden_dim', 128)
-    num_encoder_layers = checkpoint.get('num_encoder_layers', 3)
-    num_decoder_layers = checkpoint.get('num_decoder_layers', num_encoder_layers)
-    atom_context_num = checkpoint.get('atom_context_num', ATOM_CONTEXT_NUM)
 
-    model = ProteinMPNN(
-        num_letters=21, node_features=hidden_dim, edge_features=hidden_dim, hidden_dim=hidden_dim,
-        num_encoder_layers=num_encoder_layers, num_decoder_layers=num_decoder_layers,
-        k_neighbors=num_edges, augment_eps=0.0, dropout=0.1,
-        model_type="ligand_mpnn", atom_context_num=atom_context_num
-    )
-
-    model.load_state_dict(checkpoint_dict)
+def run_model(model_name, loaders, checkpoint_dir, output_dir, device, args):
+    ckpt_path = Path(checkpoint_dir) / f"{model_name}.pt"
+    if not ckpt_path.is_file():
+        raise FileNotFoundError(f"Missing pretrained checkpoint: {ckpt_path}")
+    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+    model, hidden, layers, edges = model_from_checkpoint(checkpoint, args.atom_context_num)
     model.to(device)
-
-    # Freeze encoder, unfreeze final decoder layer and output weights
-    for name, param in model.named_parameters():
-        param.requires_grad = False
-        if "W_out" in name or f"decoder_layers.{num_decoder_layers - 1}" in name:
-            param.requires_grad = True
-
-    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LEARNING_RATE)
-    scaler = torch.cuda.amp.GradScaler(enabled=USE_AMP)
-    best_val_loss = float('inf')
-
-    for epoch in range(EPOCHS):
-        model.train()
-        train_loss = 0.0
-        optimizer.zero_grad()
-
-        for step, batch_data in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}/{EPOCHS} [Train]")):
-            feat = featurize_ligand_mpnn(batch_data, device, atom_context_num)
-
-            # Synchronized noise injection
-            noise_X = torch.randn_like(feat["X"]) * parsed_noise * feat["mask"][:, :, None, None]
-            X_noised = feat["X"] + noise_X
-            randn_order = torch.randn_like(feat["mask"])
-            
-            valid_mask = feat["mask"] * feat["chain_M"]
-            
-            with autocast_context():
-                log_probs = model(
-                    X_noised, feat["S"], feat["mask"], feat["chain_M"], 
-                    feat["residue_idx"], feat["chain_encoding_all"], randn_order,
-                    Y=feat["Y"], Y_t=feat["Y_t"], Y_m=feat["Y_m"]
-                )
-                
-                _, loss_av = loss_smoothed(feat["S"], log_probs, valid_mask, weight=0.1)
-                loss_scaled = loss_av / ACCUMULATION_STEPS
-            
-            scaler.scale(loss_scaled).backward()
-            
-            if (step + 1) % ACCUMULATION_STEPS == 0 or (step + 1) == len(train_loader):
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-              
-            train_loss += loss_av.item()
-            
-        avg_train_loss = train_loss / len(train_loader)
-
-        # Validation loop
-        model.eval()
-        val_loss = 0.0
-        
-        with torch.no_grad(), autocast_context():
-            for batch_data in tqdm(val_loader, desc=f"Epoch {epoch + 1} [Val]"):
-                feat = featurize_ligand_mpnn(batch_data, device, atom_context_num)
-                randn_order = torch.randn_like(feat["mask"])
-                valid_mask = feat["mask"] * feat["chain_M"]
-                
-                log_probs = model(
-                    feat["X"], feat["S"], feat["mask"], feat["chain_M"], 
-                    feat["residue_idx"], feat["chain_encoding_all"], randn_order,
-                    Y=feat["Y"], Y_t=feat["Y_t"], Y_m=feat["Y_m"]
-                )
-
-                _, loss_av = loss_nll(feat["S"], log_probs, valid_mask)
-                val_loss += loss_av.item()
-
-        avg_val_loss = val_loss / len(val_loader)
-        print(f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
-
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            save_path = os.path.join(OUTPUT_DIR, f"{model_name}_finetuned.pt")
-            save_checkpoint = checkpoint_metadata(checkpoint)
-            save_checkpoint.update({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': best_val_loss,
-                'num_edges': num_edges,
-                'hidden_dim': hidden_dim,
-                'num_encoder_layers': num_encoder_layers,
-                'num_decoder_layers': num_decoder_layers,
-                'atom_context_num': atom_context_num,
-            })
-            torch.save(save_checkpoint, save_path)
-            print(f"--> Saved best model checkpoint to: {save_path}")
+    noise = float(model_name.split("_")[3]) / 100.0
+    for name, parameter in model.named_parameters():
+        if args.freeze_mode == "decoder_head":
+            parameter.requires_grad = name in ("W_out.weight", "W_out.bias") or \
+                f"decoder_layers.{layers - 1}." in name
+        else:  # "current": every layer's MLP output projection + last decoder layer + head
+            parameter.requires_grad = "W_out" in name or f"decoder_layers.{layers - 1}" in name
+    if args.compile_model:
+        model = torch.compile(model, fullgraph=False)
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"{model_name}: trainable {trainable / 1e6:.2f}M params (freeze_mode={args.freeze_mode}, ema={args.use_ema})")
+    optimizer = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=args.learning_rate)
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    ema = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad} if args.use_ema else None
+    best = float("inf")
+    model_dir = Path(output_dir) / model_name
+    model_dir.mkdir(parents=True, exist_ok=True)
+    for epoch in range(args.epochs):
+        model.train(); total = 0.0; optimizer.zero_grad(set_to_none=True)
+        sampler = getattr(loaders["train"], "batch_sampler", None) or loaders["train"].sampler
+        if sampler is not None and hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
+        for step, batch in enumerate(tqdm(loaders["train"], desc=f"{model_name} epoch {epoch + 1}")):
+            feat = to_device(batch, device)
+            valid = feat["mask"] * feat["chain_M"]
+            randn = torch.randn_like(feat["mask"])
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                log_probs = model(feat["X"] + torch.randn_like(feat["X"]) * noise * feat["mask"][:, :, None, None],
+                                  feat["S"], feat["mask"], feat["chain_M"], feat["residue_idx"],
+                                  feat["chain_encoding_all"], randn, Y=feat["Y"], Y_t=feat["Y_t"], Y_m=feat["Y_m"])
+                _, loss = loss_smoothed(feat["S"], log_probs, valid, weight=0.1)
+                scaled = loss / args.accumulation_steps
+            scaler.scale(scaled).backward()
+            if (step + 1) % args.accumulation_steps == 0 or step + 1 == len(loaders["train"]):
+                scaler.unscale_(optimizer); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer); scaler.update(); optimizer.zero_grad(set_to_none=True)
+                if ema is not None:
+                    decay = args.ema_decay
+                    with torch.no_grad():
+                        for n, p in model.named_parameters():
+                            if p.requires_grad:
+                                ema[n].mul_(decay).add_(p.detach(), alpha=1 - decay)
+            total += loss.item()
+        # evaluate with EMA weights
+        if ema is not None:
+            with torch.no_grad():
+                for n, p in model.named_parameters():
+                    if p.requires_grad:
+                        p.data.copy_(ema[n])
+        model.eval(); val_total = 0.0
+        with torch.no_grad():
+            for batch in loaders["val"]:
+                feat = to_device(batch, device)
+                valid = feat["mask"] * feat["chain_M"]
+                log_probs = model(feat["X"], feat["S"], feat["mask"], feat["chain_M"], feat["residue_idx"],
+                                  feat["chain_encoding_all"], torch.randn_like(feat["mask"]),
+                                  Y=feat["Y"], Y_t=feat["Y_t"], Y_m=feat["Y_m"])
+                _, loss = loss_nll(feat["S"], log_probs, valid); val_total += loss.item()
+        train_loss, val_loss = total / len(loaders["train"]), val_total / len(loaders["val"])
+        print(f"{model_name} epoch={epoch + 1} train={train_loss:.4f} val={val_loss:.4f}")
+        if val_loss < best:
+            best = val_loss
+            state = model.state_dict()
+            if ema is not None:
+                state = {k: ema.get(k, v) for k, v in state.items()}
+            torch.save({"epoch": epoch, "model_state_dict": state, "optimizer_state_dict": optimizer.state_dict(),
+                        "loss": best, "atom_context_num": args.atom_context_num, "num_edges": edges,
+                        "hidden_dim": hidden, "num_encoder_layers": layers, "noise_level": noise}, model_dir / "best.pt")
 
 
 def main():
-    # Initialize datasets and loaders once to save I/O overhead
-    print("Initializing datasets...")
-    train_dataset = MixedStructureDataset(
-        specific_jsonl=os.path.join(DATA_DIR, "train.jsonl"), 
-        general_jsonl=GENERAL_TRAIN_DATA,
-        mix_ratio=0.1, 
-        max_length=1200
-    )
-    
-    val_dataset = MixedStructureDataset(
-        specific_jsonl=os.path.join(DATA_DIR, "val.jsonl"),
-        general_jsonl=None,
-        mix_ratio=0.0
-    )
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data-dir", default="dataset")
+    ap.add_argument("--checkpoint-dir", default="../model_params")
+    ap.add_argument("--output-dir", default="training_runs")
+    ap.add_argument("--models", nargs="+", default=MODELS)
+    ap.add_argument("--epochs", type=int, default=50); ap.add_argument("--batch-size", type=int, default=4)
+    ap.add_argument("--accumulation-steps", type=int, default=8); ap.add_argument("--learning-rate", type=float, default=5e-5)
+    ap.add_argument("--atom-context-num", type=int, default=25); ap.add_argument("--max-length", type=int, default=2400)
+    ap.add_argument("--val-max-samples", type=int, default=512, help="cap on val batches per epoch (0 = full val)")
+    ap.add_argument("--samples-per-epoch", type=int, default=6000,
+                    help="training draws per epoch for the cluster-balanced sampler (0 = one draw per row); "
+                         "the target->cluster->member balance is preserved regardless")
+    ap.add_argument("--use-cluster-balanced", action="store_true", default=True, help="cluster-balanced sampling (recommended)")
+    ap.add_argument("--freeze-mode", choices=("current", "decoder_head"), default="current",
+                    help="current: every layer's W_out projection + last decoder layer + head; "
+                         "decoder_head: only final head + last decoder layer")
+    ap.add_argument("--use-ema", action="store_true", default=True, help="exponential moving average of trainable weights")
+    ap.add_argument("--ema-decay", type=float, default=0.999)
+    ap.add_argument("--compile-model", action="store_true", default=False, help="torch.compile the model (test on GPU)")
+    ap.add_argument("--num-workers", type=int, default=4, help="DataLoader workers for CPU featurization prefetch")
+    ap.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto"); ap.add_argument("--seed", type=int, default=42)
+    args = ap.parse_args(); seed_everything(args.seed)
+    device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else ("cpu" if args.device == "auto" else args.device))
+    data = Path(args.data_dir); paths = {s: data / f"{s}.jsonl" for s in ("train", "val", "test")}
+    if any(not p.is_file() for p in paths.values()): raise FileNotFoundError("Missing split JSONL")
+    metadata = validate_disjoint_jsonl({k: str(v) for k, v in paths.items()})
+    print(json.dumps({k: {"rows": v["rows"], "ligand_rows": v["ligand_rows"]} for k, v in metadata.items()}))
+    train_ds = JsonlDataset(paths["train"], args.max_length)
+    val_ds = JsonlDataset(paths["val"], args.max_length)
+    if args.val_max_samples and args.val_max_samples < len(val_ds.rows):
+        rng = np.random.default_rng(args.seed)
+        val_ds.rows = [val_ds.rows[i] for i in
+                       rng.choice(len(val_ds.rows), size=args.val_max_samples, replace=False)]
+        print(f"val subset: {len(val_ds.rows)} rows")
+    from functools import partial
+    collate = partial(collate_featurize, atom_context_num=args.atom_context_num)
+    train_sampler = ClusterBalancedSampler(train_ds.rows,
+                                           num_samples=args.samples_per_epoch or None,
+                                           seed=args.seed) if args.use_cluster_balanced else None
+    if train_sampler is not None and args.batch_size > 1:
+        train_sampler = LengthSortedBatchSampler(
+            train_sampler, [len(r["seq"]) for r in train_ds.rows],
+            args.batch_size, seed=args.seed)
+        train_loader = DataLoader(train_ds, batch_sampler=train_sampler, collate_fn=collate,
+                                  num_workers=args.num_workers, prefetch_factor=4,
+                                  pin_memory=True, persistent_workers=args.num_workers > 0)
+    elif train_sampler is not None:
+        train_loader = DataLoader(train_ds, batch_size=1, sampler=train_sampler, collate_fn=collate,
+                                  num_workers=args.num_workers, prefetch_factor=4,
+                                  pin_memory=True, persistent_workers=args.num_workers > 0)
+    else:
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate,
+                                  num_workers=args.num_workers, prefetch_factor=4,
+                                  pin_memory=True, persistent_workers=args.num_workers > 0)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate,
+                            num_workers=args.num_workers, prefetch_factor=4, pin_memory=True)
+    loaders = {"train": train_loader, "val": val_loader}
+    run = Path(args.output_dir) / datetime.now().astimezone().strftime("run_%Y%m%d_%H%M%S")
+    run.mkdir(parents=True, exist_ok=False)
+    (run / "config.json").write_text(json.dumps({**vars(args), "device": str(device)}, indent=2), encoding="utf-8")
+    for model_name in args.models: run_model(model_name, loaders, args.checkpoint_dir, run, device, args)
 
-    if len(train_dataset) == 0:
-        raise ValueError(f"No training records loaded from {DATA_DIR / 'train.jsonl'}")
-    if len(val_dataset) == 0:
-        raise ValueError(f"No validation records loaded from {DATA_DIR / 'val.jsonl'}")
 
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
-
-    # Iterate through all configured models
-    for model_name in MODELS_TO_FINETUNE:
-        train_model(model_name, train_loader, val_loader)
-
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
